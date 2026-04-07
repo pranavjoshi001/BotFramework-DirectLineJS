@@ -1198,14 +1198,6 @@ export class DirectLine implements IBotConnection {
         return !!this.voiceModeEnabled;
     }
 
-    /**
-     * Returns the current WebSocket stream URL (with /multimodal suffix if voice mode is enabled).
-     * Useful for debugging and testing.
-     */
-    getStreamUrl(): string | undefined {
-        return this.streamUrl ? this.getMultimodalStreamUrl(this.streamUrl) : undefined;
-    }
-
      /**
      * Adds an event listener for adapter events (e.g., 'capabilitieschanged').
      * Used by consumer to subscribe to capability updates.
