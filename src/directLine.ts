@@ -381,7 +381,14 @@ export interface DirectLineOptions {
      * If true, every outgoing activity will include deliveryMode: 'stream'.
      * If false/omitted, deliveryMode is not sent (defaults to 'normal' in ABS).
      */
-    streaming?: boolean
+    streaming?: boolean,
+    /**
+     * Enable voice mode for audio streaming.
+     * - If true: voice mode enabled, uses /stream/multimodal endpoint, all traffic sent via WebSocket
+     * - If false: voice mode disabled, uses existing flow as is (/stream endpoint with http post)
+     * - If undefined: auto-detect for iframes with allow="microphone" attribute
+     */
+    enableVoiceMode?: boolean
 }
 
 export interface Services {
@@ -451,6 +458,52 @@ const konsole = {
     }
 }
 
+/**
+ * Checks if the current context is running inside an iframe.
+ */
+const isInIframe = (): boolean => {
+    try {
+        return typeof window !== 'undefined' && window.self !== window.top;
+    } catch (e) {
+        // If accessing window.top throws (cross-origin), we're definitely in an iframe
+        return true;
+    }
+}
+
+/**
+ * Checks if the iframe has microphone permission via the allow attribute.
+ */
+const hasIframeMicrophonePermission = async (): Promise<boolean> => {
+    if (typeof window === 'undefined' || typeof document === 'undefined') {
+        return false;
+    }
+
+    try {
+        // Try using the Permissions Policy API (Chrome 88+, Edge 88+)
+        const doc = document as any;
+        if (doc.permissionsPolicy && typeof doc.permissionsPolicy.allowsFeature === 'function') {
+            return doc.permissionsPolicy.allowsFeature('microphone');
+        }
+
+        // Fallback to deprecated Feature Policy API (Chrome 60-87, Edge 79-87)
+        if (doc.featurePolicy && typeof doc.featurePolicy.allowsFeature === 'function') {
+            return doc.featurePolicy.allowsFeature('microphone');
+        }
+
+        // Fallback to Permissions API (broader support: Chrome 43+, Firefox 46+, Safari 16+)
+        if (typeof navigator !== 'undefined' && navigator.permissions) {
+            const result = await navigator.permissions.query({ name: 'microphone' as PermissionName });
+            // 'granted' or 'prompt' means microphone is allowed by iframe policy
+            // 'denied' means either user denied or iframe policy blocks it
+            return result.state !== 'denied';
+        }
+    } catch (e) {
+        // If permissions check fails, assume microphone is not allowed in iframe
+    }
+
+    return false;
+}
+
 export interface IBotConnection {
     connectionStatus$: BehaviorSubject<ConnectionStatus>,
     activity$: Observable<Activity>,
@@ -489,6 +542,19 @@ export class DirectLine implements IBotConnection {
     private tokenRefreshSubscription: Subscription;
     private streaming: boolean;
 
+    // Voice mode: when true, use multimodal stream endpoint and send all traffic via WebSocket
+    private voiceModeEnabled: boolean = false;
+
+    // Voice configuration default constants
+    private static readonly VOICE_SAMPLE_RATE = 24000;
+    private static readonly VOICE_CHUNK_INTERVAL_MS = 100;
+
+    // Voice configuration: set when server supports audio modality, undefined otherwise
+    private voiceConfiguration: { sampleRate: number; chunkIntervalMs: number } | undefined;
+
+    // EventTarget for dispatching capability change events
+    private eventTarget = new EventTarget();
+
     constructor(options: DirectLineOptions & Partial<Services>) {
         this.secret = options.secret;
         this.token = options.secret || options.token;
@@ -497,6 +563,9 @@ export class DirectLine implements IBotConnection {
         if (options.streaming) {
             this.streaming = options.streaming;
         }
+
+        // Initialize voice mode detection (sets voiceModeEnabled synchronously for non-iframe cases)
+        this.initializeVoiceMode(options.enableVoiceMode);
 
         if (options.conversationStartProperties && options.conversationStartProperties.locale) {
             if (Object.prototype.toString.call(options.conversationStartProperties.locale) === '[object String]') {
@@ -786,23 +855,20 @@ export class DirectLine implements IBotConnection {
         if (activity.type === "message" && activity.attachments && activity.attachments.length > 0)
             return this.postMessageWithAttachments(activity);
 
-        // if it is voice activity, send it through webSocket as voice over http is not supported in ABS.
-        // ABS limitation - client to server push is not being processed over web socket for text.
-        // Once it is implemented, we can remove this and send all traffic to the webSocket
-        if (DirectLine.isVoiceEventActivity(activity)) {
+        // When voice mode is enabled, send ALL traffic (text + voice) via WebSocket
+        if (this.voiceModeEnabled) {
             if (!this.webSocket) {
-                return Observable.throw(new Error('Voice activities require WebSocket to be enabled'), this.services.scheduler);
+                return Observable.throw(new Error('Voice mode requires WebSocket to be enabled'), this.services.scheduler);
             }
             return this.checkConnection(true)
                 .flatMap(_ =>
                     Observable.create((subscriber: Subscriber<any>) => {
-                        const envelope = { activities: [activity] };
                         try {
                             if (!this.webSocketConnection || this.webSocketConnection.readyState !== WebSocket.OPEN) {
                                 throw new Error('WebSocket connection not ready for voice activities');
                             }
-                            this.webSocketConnection.send(JSON.stringify(envelope));
-                            subscriber.next(envelope);
+                            this.webSocketConnection.send(JSON.stringify(activity));
+                            subscriber.next(activity);
                             subscriber.complete();
                         } catch (e) {
                             subscriber.error(e);
@@ -831,22 +897,6 @@ export class DirectLine implements IBotConnection {
             .catch(error => this.catchPostError(error))
         )
         .catch(error => this.catchExpiredToken(error));
-    }
-
-    // Until activity protocol changes for multi-modal output are ratified, this method
-    // identifies voice event activities using the given activity example below as payload
-    // to send voice chunks over activity protocol. The activity structure shown serves as
-    // the current solution for transmitting voice data:
-    // { "type": "event", "value": { "voice": { "contentUrl": "<base64 chunk>" } } }
-    private static isVoiceEventActivity(activity: Activity) {
-        return (
-            activity.type === 'event' &&
-            activity?.value &&
-            typeof activity?.value === 'object' &&
-            activity?.value?.voice &&
-            typeof activity?.value?.voice === 'object' &&
-            Object.keys(activity?.value?.voice).length > 0
-        );
     }
 
     private postMessageWithAttachments(message: Message) {
@@ -1000,8 +1050,11 @@ export class DirectLine implements IBotConnection {
     // implementation, I decided roll the below, where the logic is more purposeful. - @billba
     private observableWebSocket<T>() {
         return Observable.create((subscriber: Subscriber<T>) => {
-            konsole.log("creating WebSocket", this.streamUrl);
-            this.webSocketConnection = new this.services.WebSocket(this.streamUrl);
+            // Apply multimodal stream URL if voice mode is enabled
+            const streamUrl = this.getMultimodalStreamUrl(this.streamUrl);
+
+            konsole.log("creating WebSocket", streamUrl);
+            this.webSocketConnection = new this.services.WebSocket(streamUrl);
             let sub: Subscription;
             let closed: boolean;
 
@@ -1040,7 +1093,13 @@ export class DirectLine implements IBotConnection {
                 closed = true;
             }
 
-            this.webSocketConnection.onmessage = message => message.data && subscriber.next(JSON.parse(message.data));
+            this.webSocketConnection.onmessage = message => {
+                if (message.data) {
+                    const data = JSON.parse(message.data);
+                    this.handleIncomingActivity(data);
+                    subscriber.next(data);
+                }
+            };
 
             // This is the 'unsubscribe' method, which is called when this observable is disposed.
             // When the WebSocket closes itself, we throw an error, and this function is eventually called.
@@ -1122,6 +1181,46 @@ export class DirectLine implements IBotConnection {
         this.userIdOnStartConversation = userId;
     }
 
+    /**
+     * Returns voice configuration from server's agent.capabilities event, or undefined if server doesn't support audio.
+     * Use this to configure microphone settings. Only available after server confirms audio support.
+     */
+    getVoiceConfiguration() {
+        return this.voiceConfiguration;
+    }
+
+    /**
+     * Returns true if multimodal experience is requested (client-side), false otherwise.
+     * Does NOT guarantee server supports voice - use getVoiceConfiguration() for that.
+     * Use this to determine if activities are sent via WebSocket (no echo-back wait needed).
+     */
+    getIsVoiceModeEnabled(): boolean {
+        return !!this.voiceModeEnabled;
+    }
+
+    /**
+     * Returns the current WebSocket stream URL (with /multimodal suffix if voice mode is enabled).
+     * Useful for debugging and testing.
+     */
+    getStreamUrl(): string | undefined {
+        return this.streamUrl ? this.getMultimodalStreamUrl(this.streamUrl) : undefined;
+    }
+
+     /**
+     * Adds an event listener for adapter events (e.g., 'capabilitieschanged').
+     * Used by consumer to subscribe to capability updates.
+     */
+    addEventListener(type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions): void {
+        this.eventTarget.addEventListener(type, listener, options);
+    }
+
+    /**
+     * Removes an event listener for adapter events.
+     */
+    removeEventListener(type: string, listener: EventListenerOrEventListenerObject, options?: boolean | EventListenerOptions): void {
+        this.eventTarget.removeEventListener(type, listener, options);
+    }
+
     private parseToken(token: string) {
         try {
             const { user } = jwtDecode<JwtPayload>(token) as { [key: string]: any; };
@@ -1131,6 +1230,79 @@ export class DirectLine implements IBotConnection {
                 return undefined;
             }
         }
+    }
+
+    /**
+     * Initialize voice mode.
+     * - Explicit true/false: set synchronously (no race condition)
+     * - Undefined: auto-detect for iframes with microphone permission (async, best effort)
+     */
+    private initializeVoiceMode(enableVoiceMode?: boolean): void {
+        // Explicit true: enable synchronously
+        if (enableVoiceMode === true) {
+            this.voiceModeEnabled = true;
+            this.eventTarget.dispatchEvent(new Event('capabilitieschanged'));
+            return;
+        }
+
+        // Explicit false: already false by default, nothing to do
+        if (enableVoiceMode === false) {
+            return;
+        }
+
+        // Undefined: auto-detect for iframe with microphone permission (async)
+        if (isInIframe()) {
+            hasIframeMicrophonePermission().then(hasMic => {
+                if (hasMic) {
+                    this.voiceModeEnabled = true;
+                    this.eventTarget.dispatchEvent(new Event('capabilitieschanged'));
+                }
+            });
+        }
+    }
+
+    /**
+     * Handles incoming activity group to check for agent.capabilities event.
+     * Sets voice configuration if server supports audio modality.
+     */
+    private handleIncomingActivity(data: any): void {
+        const activities = data?.activities;
+        if (!Array.isArray(activities)) {
+            return;
+        }
+
+        for (const activity of activities) {
+            if (activity?.type === 'event' && activity?.name === 'agent.capabilities') {
+                const modalities = activity?.value?.modalities;
+                const hasAudio = modalities?.audio &&
+                    typeof modalities.audio === 'object' &&
+                    Object.keys(modalities.audio).length > 0;
+
+                if (hasAudio) {
+                    this.voiceConfiguration = {
+                        sampleRate: DirectLine.VOICE_SAMPLE_RATE,
+                        chunkIntervalMs: DirectLine.VOICE_CHUNK_INTERVAL_MS
+                    };
+                    this.eventTarget.dispatchEvent(new Event('capabilitieschanged'));
+                }
+            }
+        }
+    }
+
+    /**
+     * Modifies stream URL for voice mode: replaces /stream with /stream/multimodal
+     */
+    private getMultimodalStreamUrl(url: string): string {
+        if (!this.voiceModeEnabled || !url) {
+            return url;
+        }
+
+        // Replace /stream endpoint with /stream/multimodal (if not already multimodal)
+        if (!url.includes('/stream/multimodal')) {
+            return url.replace('/stream', '/stream/multimodal');
+        }
+
+        return url;
     }
 
 }
