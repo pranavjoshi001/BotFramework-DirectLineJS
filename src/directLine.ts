@@ -1267,8 +1267,7 @@ export class DirectLine implements IBotConnection {
             if (activity?.type === 'event' && activity?.name === 'agent.capabilities') {
                 const modalities = activity?.value?.modalities;
                 const hasAudio = modalities?.audio &&
-                    typeof modalities.audio === 'object' &&
-                    Object.keys(modalities.audio).length > 0;
+                    typeof modalities.audio === 'object';
 
                 if (hasAudio) {
                     this.voiceConfiguration = {
