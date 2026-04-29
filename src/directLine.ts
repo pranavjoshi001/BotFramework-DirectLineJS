@@ -37,6 +37,8 @@ import { objectExpression } from '@babel/types';
 import { DirectLineStreaming } from './directLineStreaming';
 export { DirectLineStreaming };
 
+import { hasIframeMicrophonePermission, isInIframe } from './iframeMicrophone';
+
 const DIRECT_LINE_VERSION = 'DirectLine/3.0';
 
 declare var process: {
@@ -456,52 +458,6 @@ const konsole = {
         if (typeof window !== 'undefined' && (window as any)["botchatDebug"] && message)
             console.log(message, ... optionalParams);
     }
-}
-
-/**
- * Checks if the current context is running inside an iframe.
- */
-const isInIframe = (): boolean => {
-    try {
-        return typeof window !== 'undefined' && window.self !== window.top;
-    } catch (e) {
-        // If accessing window.top throws (cross-origin), we're definitely in an iframe
-        return true;
-    }
-}
-
-/**
- * Checks if the iframe has microphone permission via the allow attribute.
- */
-const hasIframeMicrophonePermission = async (): Promise<boolean> => {
-    if (typeof window === 'undefined' || typeof document === 'undefined') {
-        return false;
-    }
-
-    try {
-        // Try using the Permissions Policy API (Chrome 88+, Edge 88+)
-        const doc = document as any;
-        if (doc.permissionsPolicy && typeof doc.permissionsPolicy.allowsFeature === 'function') {
-            return doc.permissionsPolicy.allowsFeature('microphone');
-        }
-
-        // Fallback to deprecated Feature Policy API (Chrome 60-87, Edge 79-87)
-        if (doc.featurePolicy && typeof doc.featurePolicy.allowsFeature === 'function') {
-            return doc.featurePolicy.allowsFeature('microphone');
-        }
-
-        // Fallback to Permissions API (broader support: Chrome 43+, Firefox 46+, Safari 16+)
-        if (typeof navigator !== 'undefined' && navigator.permissions) {
-            const result = await navigator.permissions.query({ name: 'microphone' as PermissionName });
-            // 'granted' or 'prompt' means microphone is allowed by iframe policy
-            // 'denied' means either user denied or iframe policy blocks it
-            return result.state !== 'denied';
-        }
-    } catch (e) {
-        // If permissions check fails, assume microphone is not allowed in iframe
-    }
-
-    return false;
 }
 
 export interface IBotConnection {
@@ -1281,19 +1237,26 @@ export class DirectLine implements IBotConnection {
     }
 
     /**
-     * Modifies stream URL for voice mode: replaces /stream with /stream/multimodal
+     * Modifies stream URL for voice mode: appends /multimodal to the /stream path
+     * while preserving query string, hash, and other URL parts.
      */
     private getMultimodalStreamUrl(url: string): string {
         if (!this.voiceModeEnabled || !url) {
             return url;
         }
 
-        // Replace /stream endpoint with /stream/multimodal (if not already multimodal)
-        if (!url.includes('/stream/multimodal')) {
-            return url.replace('/stream', '/stream/multimodal');
-        }
+        try {
+            const parsed = new URL(url);
 
-        return url;
+            if (parsed.pathname.endsWith('/stream')) {
+                parsed.pathname += '/multimodal';
+            }
+
+            return parsed.toString();
+        } catch {
+            // If URL parsing fails (malformed URL), return as-is
+            return url;
+        }
     }
 
 }
